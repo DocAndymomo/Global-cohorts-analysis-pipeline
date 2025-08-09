@@ -1,4 +1,5 @@
 # Global Cohorts Analysis Pipeline
+Chencheng Mo 09/08/2025
 
 ## Introduction
 This pipeline integrates two-step host sequence removal, robust species annotation, and multi-center contamination filtering, making it highly suitable for large-scale, cross-cohort microbiome studies. By combining deep host depletion, high-resolution taxonomic classification, and multi-cohort contamination filtering, the pipeline achieves lower contamination rates and greater analytical precision than conventional metagenomic workflows.
