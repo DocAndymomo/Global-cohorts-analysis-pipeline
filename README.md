@@ -1,7 +1,7 @@
 # Global Cohorts Analysis Pipeline
 
 ## Introduction
-The **Global Cohorts Analysis Pipeline** enables the **systematic recovery** and **high-precision profiling** of microbial communities from human genomic and transcriptomic sequencing data, with **minimized contamination**.
+The **Global Cohorts Analysis Pipeline** enables the systematic recovery and high-precision profiling of microbial communities from human genomic and transcriptomic sequencing data, with **minimized contamination**.
 
 This pipeline integrates **two-step host sequence removal**, **robust species annotation**, and **multi-center contamination filtering**, making it highly suitable for **large-scale, cross-cohort microbiome studies**.
 
