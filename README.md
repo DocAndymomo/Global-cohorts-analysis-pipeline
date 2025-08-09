@@ -9,7 +9,7 @@ This pipeline integrates two-step host sequence removal, robust species annotati
 
 ### Main Features
 - Two-step host removal using both GRCh38.p14 and CHM13 v2.0 reference genomes to maximize removal of host sequences.
-- High-accuracy species annotation with Kraken2 + Bracken using the PlusPF database.
+- High-accuracy species annotation with Kraken2 + Bracken using an updated Kraken PlusPF reference database.
 - Cross-cohort contamination removal using a multi-center contamination database and decontam filtering.
 - Final microbiome abundance tables generated from high-confidence reads for downstream statistical analyses.
 
@@ -18,7 +18,7 @@ This pipeline integrates two-step host sequence removal, robust species annotati
 ## Step-by-Step Pipeline
 
 ### Step 1 – Raw Data Conversion (`01-Raw2fastq`)
-Convert raw sequencing output (e.g., BCL format) into FASTQ files, ensuring proper sample demultiplexing and metadata integrity.
+Convert raw sequencing output (e.g., SRA, BAM formats) into FASTQ files, ensuring proper sample demultiplexing, metadata integrity, and concatenation of sequencing reads when necessary.
 
 ### Step 2 – Quality Control (`02-fastp`)
 Perform read trimming and quality filtering using fastp (v0.23.4) to remove low-quality bases, adapters, and sequencing artifacts.
@@ -46,3 +46,4 @@ Extract high-confidence microbial reads and generate final microbiome abundance 
 - Improved Precision — Dual-host genome alignment combined with Bracken refinement for species-level accuracy.
 - Scalable — Optimized for integration of datasets from multiple global cohorts.
 - Reproducible — Modular structure with version-controlled tools and databases.
+
