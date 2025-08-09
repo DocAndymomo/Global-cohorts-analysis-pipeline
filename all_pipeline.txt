@@ -1,0 +1,616 @@
+####1、转换bam文件为fastq文件
+# 查找所有 .sra 文件，包括子目录中的文件
+find "$input_folder" -name "*.sra" | while read -r sra_file; do
+    # 检查是否是文件
+    if [[ -f "$sra_file" ]]; then
+        # 获取文件名（不含扩展名）
+        filename=$(basename -- "$sra_file")
+        filename_noext="${filename%.sra}"
+
+        # 指定未压缩的输出文件路径
+        output_file_prefix="$output_folder/${filename_noext}"
+
+        # 检查输出文件是否存在
+        output_exists=false
+        for fastq_file in "${output_file_prefix}"*.fastq.gz; do
+            if [[ -f "$fastq_file" ]]; then
+                output_exists=true
+                break
+            fi
+        done
+
+        if [ "$output_exists" = true ]; then
+            echo "Skipped: $sra_file (output files already exist)"
+            continue
+        fi
+
+        # 执行转换，并指定输出目录和临时文件目录
+        /root/1-Biosoft/sratoolkit.3.1.0-ubuntu64/bin/fasterq-dump "$sra_file" --split-3 -p -e 96 -O "$output_folder" --temp "$temp_folder"
+
+        # 压缩输出文件。假设 `--split-3` 会产生 1 到 3 个 fastq 文件
+        for fastq_file in "${output_file_prefix}"*.fastq; do
+            if [[ -f "$fastq_file" ]]; then
+                pigz -p 96 "$fastq_file"
+            fi
+        done
+
+        echo "Processed: $sra_file"
+    fi
+done
+
+# 统计未完成转换的 .sra 文件
+echo "未完成转换的 .sra 文件："
+find "$input_folder" -name "*.sra" | while read -r sra_file; do
+    filename=$(basename -- "$sra_file")
+    filename_noext="${filename%.sra}"
+    output_file_prefix="$output_folder/${filename_noext}"
+    
+    # 检查是否存在对应的 .fastq.gz 文件
+    fastq_files_count=$(find "${output_file_prefix}"*.fastq.gz 2>/dev/null | wc -l)
+    if [ "$fastq_files_count" -eq 0 ]; then
+        echo "$sra_file"
+    fi
+done
+
+####2、连接分段的fastq文件
+# 读取匹配文件并处理每一行
+while IFS=$'\t' read -r SAMPLE_NAME FASTQ_FILE; do
+    # 根据样本名和文件名中的_1或_2后缀，确定目标文件名
+    if [[ $FASTQ_FILE =~ _1.fastq.gz ]]; then
+        TARGET_FASTQ="$TARGET_DIR/${SAMPLE_NAME}_merged_1.fastq.gz"
+    elif [[ $FASTQ_FILE =~ _2.fastq.gz ]]; then
+        TARGET_FASTQ="$TARGET_DIR/${SAMPLE_NAME}_merged_2.fastq.gz"
+    else
+        echo "Warning: File name does not match expecy6ted pattern: $FASTQ_FILE"
+        continue
+    fi
+    
+    # 如果目标文件的文件描述符尚未打开，那么打开它
+    if [ -z "${FD_MAP[$TARGET_FASTQ]}" ]; then
+        exec {FD}>"$TARGET_FASTQ"
+        FD_MAP["$TARGET_FASTQ"]=$FD
+    else
+        FD=${FD_MAP["$TARGET_FASTQ"]}
+    fi
+    
+    # 将文件内容追加到目标文件
+    cat "$SOURCE_DIR/$FASTQ_FILE" >&$FD
+    
+done < "$MATCH_FILE"
+
+# 关闭所有打开的文件描述符
+for FD in ${FD_MAP[@]}; do
+    exec {FD}>&-
+done
+
+echo "All files processed."
+
+####3、使用fastp质控
+count=0 # 当前正在运行的进程数
+
+for forward_file in "$input_dir"/*_1.fastq.gz; do
+  # 提取文件名和扩展名
+  filename=$(basename "$forward_file")
+  filename_no_ext="${filename%_1.fastq.gz}"
+  # 生成反向文件名
+  reverse_file="${input_dir}/${filename_no_ext}_2.fastq.gz"
+  # 生成输出文件路径，文件名中加入fastp
+  output_forward="${output_dir}${filename_no_ext}_fastp_1.fastq.gz"
+  output_reverse="${output_dir}${filename_no_ext}_fastp_2.fastq.gz"
+  
+  # 检查输出文件是否已存在，如果存在则跳过循环
+  if [ -f "$output_forward" ] && [ -f "$output_reverse" ]; then
+    echo "Skipped: $forward_file"
+    echo "Skipped: $reverse_file"
+    continue
+  fi
+  
+  # 执行 fastp 命令，并放到后台
+  fastp -i "$forward_file" -o "$output_forward" -I "$reverse_file" -O "$output_reverse" -Q --thread=48 --length_required=45 –stdout –interleaved --compression=6 --html "${html_dir}${filename_no_ext}_fastp.html" &
+  echo "Processed: $forward_file"
+  echo "Processed: $reverse_file"
+  ((count++)) # 当前正在运行的进程数加1
+  
+  if [ $count -ge 80 ]; then
+    wait # 等待前面的进程完成
+    count=0 # 重置计数器
+  fi
+
+done
+
+wait  # 等待剩余的进程完成
+
+####4、bowtie2去除宿主序列
+# 遍历文件夹中的所有fastq文件
+for file in "$input_folder"/*_R1.fastq.gz; do
+    # 获取文件名和路径
+    filename=$(basename "$file")
+    # 提取文件名前中第一个'_'前的部分
+    file_prefix="${filename%%_*}"
+
+    
+    # 指定输出路径和文件名
+    output="${file_prefix}_chm_remove"
+    output_R1="${output}_R1.fastq.gz"
+    output_R2="${output}_R2.fastq.gz"
+    
+    # 检查是否已经存在解析的文件
+    if [[ -e "$output_folder/$output_R1" ]] && [[ -e "$output_folder/$output_R2" ]]; then
+        echo "跳过文件 ${output_R1} 和 ${output_R2}，因为它们已经存在。"
+        continue
+    fi
+    
+    # 构建第二端fastq文件的路径
+    input_R2="$input_folder/${file_prefix}_host_remove_R2.fastq.gz"
+    
+    # 运行Bowtie2，并将输出重定向到 /dev/null
+    echo "Running bowtie2 for $file and $input_R2..."
+
+    /root/1-Biosoft/bowtie2-2.5.3-linux-x86_64/bowtie2 -p 40 --quiet -x "$db_bowtie2" -1 "$file" -2 "$input_R2" --un-conc-gz "$output_folder/$output" --no-unal > /dev/null 2>&1 &
+    # 等待 bowtie2 任务完成
+    wait
+    
+    # 检查并重命名生成的host-sequence free样本
+    if [[ -e "$output_folder/${output}.1" ]] && [[ -e "$output_folder/${output}.2" ]]; then
+        mv "$output_folder/${output}.1" "$output_folder/$output_R1" > /dev/null 2>&1
+        mv "$output_folder/${output}.2" "$output_folder/$output_R2" > /dev/null 2>&1
+        echo "Processed and moved files for $file_prefix"
+    else
+        echo "Error: Bowtie2 did not generate expected output files for $file_prefix"
+    fi
+    
+done
+
+# 确保等待剩余的进程完成
+wait
+
+####5、使用kraken进行微生物分类
+import os
+import subprocess
+import argparse
+import random
+from multiprocessing import Pool
+from datetime import datetime
+
+def print_colorful_message(message, color):
+    """
+    Print a colorful message to the console.
+
+    Args:
+        message (str): The message to be printed.
+        color (str): The color code to be applied.
+                     'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white'
+    """
+    colors = {
+        'red': '\033[91m',
+        'green': '\033[92m',
+        'yellow': '\033[93m',
+        'blue': '\033[94m',
+        'magenta': '\033[95m',
+        'cyan': '\033[96m',
+        'white': '\033[97m',
+    }
+    end_color = '\033[0m'
+    if color not in colors:
+        print("Invalid color. Please choose from 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white'.")
+        return
+    colored_message = f"{colors[color]}{message}{end_color}"
+    print(colored_message)
+
+def process_sample(sample_id, path6_rcr, path7_ku2, path8_bracken, db_ku, itm_path, num_threads, force, se):
+    task_complete_file = os.path.join(path7_ku2, f"{sample_id}.task.complete")
+    if os.path.exists(task_complete_file) and os.path.exists(os.path.join(path7_ku2, f"{sample_id}.kraken.report.txt")) and not force:
+        print(f">>== Sample {sample_id} processing already completed. Skipping...")
+        return
+    
+    print("  ")
+    print(f">>>== Processing sample: {sample_id} .")
+    if se:
+        faq_mr1 = os.path.join(path6_rcr, f"{sample_id}_rcr.fastq.gz")
+        kraken_report = os.path.join(path7_ku2, f"{sample_id}.kraken.report.txt")
+        kraken_out = os.path.join(path7_ku2, f"{sample_id}.kraken.output.txt")
+
+        # Run Kraken2
+        subprocess.run(["kraken2", "--db", db_ku, "--threads", str(num_threads), "--report-minimizer-data", "--report",
+                        kraken_report, "--use-names", "--output", kraken_out, faq_mr1])
+    else:
+        faq_mr1 = os.path.join(path6_rcr, f"{sample_id}_rcr_1.fastq.gz")
+        faq_mr2 = os.path.join(path6_rcr, f"{sample_id}_rcr_2.fastq.gz")
+        kraken_report = os.path.join(path7_ku2, f"{sample_id}.kraken.report.txt")
+        kraken_out = os.path.join(path7_ku2, f"{sample_id}.kraken.output.txt")
+
+        # Run Kraken2
+        subprocess.run(["kraken2", "--db", db_ku, "--threads", str(num_threads), "--paired", "--report-minimizer-data", "--report",
+                        kraken_report, "--use-names", "--output", kraken_out, "--paired", faq_mr1, faq_mr2])
+
+    # Convert Kraken report to MPA format
+    kraken_report_std = os.path.join(path7_ku2, f"{sample_id}.kraken.report.std.txt")
+    with open(kraken_report_std, "w") as f:
+        subprocess.run(["cut", "-f1-3,6-8", kraken_report], stdout=f)
+    mpa_output_std = os.path.join(path7_ku2, f"{sample_id}.kraken.mpa.std.txt")
+    with open(mpa_output_std, "w") as f:
+        subprocess.run(["python", os.path.join(itm_path, "itm_helper", "kreport2mpa.py"), "-r", kraken_report_std, "-o", mpa_output_std], stdout=f)
+
+    # Run Bracken for abundance estimation
+    bracken_output_g = os.path.join(path8_bracken, f"{sample_id}.g.bracken")
+    bracken_output_s = os.path.join(path8_bracken, f"{sample_id}.s.bracken")
+    bracken_output_f = os.path.join(path8_bracken, f"{sample_id}.f.bracken")
+    bracken_output_o = os.path.join(path8_bracken, f"{sample_id}.o.bracken")
+    subprocess.run(["bracken", "-d", db_ku, "-i", kraken_report, "-o", bracken_output_g, "-r", "100", "-l", "G", "-t", "2"])
+    subprocess.run(["bracken", "-d", db_ku, "-i", kraken_report, "-o", bracken_output_s, "-r", "100", "-l", "S", "-t", "2"])
+    subprocess.run(["bracken", "-d", db_ku, "-i", kraken_report, "-o", bracken_output_f, "-r", "100", "-l", "F", "-t", "2"])
+    subprocess.run(["bracken", "-d", db_ku, "-i", kraken_report, "-o", bracken_output_o, "-r", "100", "-l", "O", "-t", "2"])
+
+    # Calculate alpha diversity
+    diversity_output_g = os.path.join(path8_bracken, f"{sample_id}.diversity.g.txt")
+    diversity_output_s = os.path.join(path8_bracken, f"{sample_id}.diversity.s.txt")
+    itm_path2 = os.path.join(itm_path, "itm_helper")
+
+    with open(diversity_output_g, "a") as f:
+        subprocess.run(["python", os.path.join(itm_path2, "alpha_diversity.py"), "-f", bracken_output_g, "-a", "Sh"], stdout=f)
+        subprocess.run(["python", os.path.join(itm_path2, "alpha_diversity.py"), "-f", bracken_output_g, "-a", "BP"], stdout=f)
+        subprocess.run(["python", os.path.join(itm_path2, "alpha_diversity.py"), "-f", bracken_output_g, "-a", "Si"], stdout=f)
+        subprocess.run(["python", os.path.join(itm_path2, "alpha_diversity.py"), "-f", bracken_output_g, "-a", "ISi"], stdout=f)
+        subprocess.run(["python", os.path.join(itm_path2, "alpha_diversity.py"), "-f", bracken_output_g, "-a", "F"], stdout=f)
+    with open(diversity_output_s, "a") as f:
+        subprocess.run(["python", os.path.join(itm_path2, "alpha_diversity.py"), "-f", bracken_output_s, "-a", "Sh"], stdout=f)
+        subprocess.run(["python", os.path.join(itm_path2, "alpha_diversity.py"), "-f", bracken_output_s, "-a", "BP"], stdout=f)
+        subprocess.run(["python", os.path.join(itm_path2, "alpha_diversity.py"), "-f", bracken_output_s, "-a", "Si"], stdout=f)
+        subprocess.run(["python", os.path.join(itm_path2, "alpha_diversity.py"), "-f", bracken_output_s, "-a", "ISi"], stdout=f)
+        subprocess.run(["python", os.path.join(itm_path2, "alpha_diversity.py"), "-f", bracken_output_s, "-a", "F"], stdout=f)
+
+    # Mark sample as completed
+    with open(task_complete_file, "w") as f:
+        f.write(">>>== Processing completed.")
+
+def step6_kraken2Bracken(path6_rcr, path7_ku2, path8_bracken, db_ku, itm_path, num_threads=8, force=False, se=False):
+    print("   ")
+    print_colorful_message("#########################################################", "blue")
+    print_colorful_message(" ITMfinder: Identifing Intratumoral Microbiome pipeline ", "cyan")
+    print_colorful_message(" If you encounter any issues, please report them at ", "cyan")
+    print_colorful_message(" https://github.com/LiaoWJLab/ITMfinder/issues ", "cyan")
+    print_colorful_message("#########################################################", "blue")
+    print(" Author: Dongqiang Zeng, Qianqian Mao ")
+    print(" Email: interlaken@smu.edu.cn ")
+    print_colorful_message("#########################################################", "blue")
+    print("   ")
+
+    print(" >>> Perform taxonomic classification using Kraken2...")
+    # Create output directories if they do not exist
+    os.makedirs(path7_ku2, exist_ok=True)
+    os.makedirs(path8_bracken, exist_ok=True)
+
+    # Get list of microbiome reads files
+    if se:
+         mr_files = [file for file in os.listdir(path6_rcr) if file.endswith("_rcr.fastq.gz")]
+    else:
+         mr_files = [file for file in os.listdir(path6_rcr) if file.endswith("_rcr_1.fastq.gz")]
+
+    total_files = len(mr_files)
+    random.shuffle(mr_files)  # Shuffle the list of files
+
+    for sample_id in mr_files:
+       if se:
+           sample_id = sample_id[:-len("_rcr.fastq.gz")]  # Remove "_rcr.fastq.gz" suffix
+       else:
+          sample_id = sample_id[:-len("_rcr_1.fastq.gz")]  # Remove "_rcr_1.fastq.gz" suffix
+    
+       process_sample(sample_id, path6_rcr, path7_ku2, path8_bracken, db_ku, itm_path, num_threads, force, se)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Step 6: Taxonomic classification using Kraken2 for report")
+    parser.add_argument("--path6_rcr", type=str, help="Path to microbiome reads after decontainmination")
+    parser.add_argument("--path7_ku2", type=str, help="Path to Kraken2 outputs for report")
+    parser.add_argument("--path8_bracken", type=str, help="Path for Bracken outputs")
+    parser.add_argument("--db_ku", type=str, help="Path to Kraken2 database")
+    parser.add_argument("--itm_path", type=str, help="Path to ITMfinder")
+    parser.add_argument("--num_threads", type=int, default=8, help="Number of threads")
+    parser.add_argument("--force", action="store_true", help="Force execution of downstream Kraken2 process")
+    parser.add_argument("--se", action="store_true", help="Indicate single-end reads")
+    args = parser.parse_args()
+
+    # Call the function with provided arguments
+    step6_kraken2Bracken(args.path6_rcr, args.path7_ku2, args.path8_bracken, args.db_ku, args.itm_path, args.num_threads, args.force, args.se)
+
+
+
+####6、提取微生物序列
+TID1=2 # 细菌 
+TID2=10239 # 病毒 
+TID3=4751 # 真菌 
+TID4=2157 #古细菌
+input_folder="/mnt/DATA1/TCGA/04-bowtie22" 
+report_folder="/mnt/DATA1/TCGA/05-ku" 
+output_folder="/mnt/DATA1/TCGA/06-mr" 
+mkdir -p "$output_folder" 
+code_path="/root/1-Biosoft/KrakenTools-1.2"
+# Get a list of all fastq.gz files with _host_remove suffix in the input folder
+fastq_files=("${input_folder}"/*_host_remove_R1.fastq.gz)
+# Process each sample
+for fastq_r1 in "${fastq_files[@]}"; do
+    # Extract the sample ID from the file name
+    sample_id=$(basename "${fastq_r1}" _host_remove_R1.fastq.gz)
+    
+    # Construct the full file paths
+    fastq_r2="${input_folder}/${sample_id}_host_remove_R2.fastq.gz" 
+    report_file="${report_folder}/${sample_id}_.kraken.report.txt" 
+    kraken_output="${report_folder}/${sample_id}_.kraken.output.txt" 
+    output_r1="${output_folder}/${sample_id}_mr_1.fastq" 
+    output_r2="${output_folder}/${sample_id}_mr_2.fastq"
+    
+    # Check if the result files already exist in the output folder
+    if [[ -f "${output_r1}" ]] && [[ -f "${output_r2}" ]]; then 
+        echo "Skipping sample ${sample_id} as result files already exist." 
+        continue
+    fi
+    
+    # Call the extract_kraken_reads.py script for the sample
+    python "${code_path}/extract_kraken_reads.py" \
+           -k "${kraken_output}" \
+           -s1 "${fastq_r1}" \
+           -s2 "${fastq_r2}" \
+           -o "${output_r1}" \
+           -o2 "${output_r2}" \
+           -t "${TID1}" "${TID2}" "${TID3}" "${TID4}"\
+           --include-children \
+           -r "${report_file}" \
+           --include-parents
+done
+
+####7、去污流程
+import os
+import subprocess
+import argparse
+from multiprocessing import Pool
+import gzip
+
+def print_colorful_message(message, color):
+    colors = {
+        'red': '\033[91m',
+        'green': '\033[92m',
+        'yellow': '\033[93m',
+        'blue': '\033[94m',
+        'magenta': '\033[95m',
+        'cyan': '\033[96m',
+        'white': '\033[97m',
+    }
+    end_color = '\033[0m'
+    if color not in colors:
+        print("Invalid color. Please choose from 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white'.")
+        return
+    colored_message = f"{colors[color]}{message}{end_color}"
+    print(colored_message)
+
+def compress_to_gz(file_path):
+    if file_path and os.path.exists(file_path):
+        with open(file_path, 'rb') as f_in:
+            with gzip.open(file_path + '.gz', 'wb') as f_out:
+                f_out.writelines(f_in)
+        os.remove(file_path)
+    else:
+        print(f"File {file_path} not found or invalid. Compression skipped.")
+
+def rmc_extract_microbiome_reads(sample_info, is_single_end=False, itm_path=None):
+    sample_id, fastq_r1, kraken_output, output_r1, output_r3, output_r4, path4_ku1, path6_rcr = sample_info
+    report_file = os.path.join(path4_ku1, f"{sample_id}_.kraken.report.txt")
+    task_complete_file = os.path.join(path6_rcr, f"{sample_id}.task.complete")
+
+    if os.path.exists(report_file) and os.path.exists(task_complete_file):
+        print(f">>> Sample {sample_id} already processed. Skipping...")
+        return
+
+    conta_file = os.path.join(itm_path, "itm_helper", "conta_list.txt")
+    with open(conta_file, "r") as file:
+        lines = file.readlines()
+    second_column = [line.strip().split()[1] for line in lines if len(line.strip().split()) > 1]
+    conta_ls = [taxid for taxid in second_column if taxid.isdigit()]
+
+    print_colorful_message(f">>> Running decontamination process for sample {sample_id}...", "cyan")
+
+    if is_single_end:
+        process_args = ["python", os.path.join(itm_path, "itm_helper", "extract_kraken_reads.py"),
+                        "-k", kraken_output, "-U", fastq_r1, "-o", output_r1,
+                        "--taxid", *conta_ls, "--exclude", "--include-children", "-r", report_file]
+    else:
+        fastq_r2 = fastq_r1.replace("_mr_1.fastq", "_mr_2.fastq")
+        process_args = ["python", os.path.join(itm_path, "itm_helper", "extract_kraken_reads.py"),
+                        "-k", kraken_output, "-s1", fastq_r1, "-s2", fastq_r2, "-o", output_r3, "-o2", output_r4,
+                        "--taxid", *conta_ls, 
+                        "--exclude", "--include-children", "-r", report_file]
+
+    process_args = [arg for arg in process_args if arg is not None]
+
+    print(f"Running command: {' '.join(process_args)}")
+
+    process = subprocess.Popen(process_args)
+    process.wait()
+    if process.returncode == 0:
+        with open(task_complete_file, "w") as f:
+            f.write("Task completed.")
+        print(f">>>--- Sample {sample_id} processed successfully.")
+        print("   ")
+
+        if is_single_end:
+            compress_to_gz(output_r1)
+        else:
+            compress_to_gz(output_r3)
+            compress_to_gz(output_r4)
+    else:
+        print(f"Error occurred while processing sample {sample_id}.")
+
+def step5_decontamination(path5_mr, path4_ku1, path6_rcr, itm_path, batch_size=1, is_single_end=False):
+    print("   ")
+    print_colorful_message("#########################################################", "blue")
+    print_colorful_message(" ITMtools: Identifing Intratumoral Microbiome pipeline ", "cyan")
+    print_colorful_message(" If you encounter any issues, please report them at ", "cyan")
+    print_colorful_message(" https://github.com/LiaoWJLab/ITMtools/issues ", "cyan")
+    print_colorful_message("#########################################################", "blue")
+    print(" Author: Dongqiang Zeng, Qianqian Mao ")
+    print(" Email: interlaken@smu.edu.cn ")
+    print_colorful_message("#########################################################", "blue")
+    print("   ")
+
+    print("  Extracting microbiome reads using extract_kraken_reads.py from KrakenTools:")
+    print("  https://github.com/jenniferlu717/KrakenTools")
+
+    print("   ")
+    print("   ")
+
+    os.makedirs(path6_rcr, exist_ok=True)
+
+    if is_single_end:
+        fastq_files = [file for file in os.listdir(path5_mr) if file.endswith("_mr.fastq")]
+    else:
+        fastq_files = [file for file in os.listdir(path5_mr) if file.endswith("_mr_1.fastq")]
+
+    print(f"Found {len(fastq_files)} FASTQ files to process.")
+
+    if not fastq_files:
+        print("No FASTQ files found. Please check the input directory and file naming conventions.")
+        return
+
+    samples = []
+    for fastq_r1 in fastq_files:
+        if is_single_end:
+            sample_id = fastq_r1.replace("_mr.fastq", "")
+            fastq_r1_path = os.path.join(path5_mr, f"{sample_id}_mr.fastq")
+            samples.append((sample_id, fastq_r1_path, os.path.join(path4_ku1, f"{sample_id}_.kraken.output.txt"),
+                            os.path.join(path6_rcr, f"{sample_id}_rcr.fastq"), None, None, path4_ku1, path6_rcr))
+        else:
+            sample_id = fastq_r1.replace("_mr_1.fastq", "")
+            fastq_r1_path = os.path.join(path5_mr, f"{sample_id}_mr_1.fastq")
+            fastq_r2_path = os.path.join(path5_mr, f"{sample_id}_mr_2.fastq")
+            samples.append((sample_id, fastq_r1_path, os.path.join(path4_ku1, f"{sample_id}_.kraken.output.txt"), None, 
+                            os.path.join(path6_rcr, f"{sample_id}_rcr_1.fastq"), os.path.join(path6_rcr, f"{sample_id}_rcr_2.fastq"), 
+                            path4_ku1, path6_rcr))
+
+    print(f"Processing {len(samples)} samples in batches of {batch_size}.")
+
+    with Pool() as pool:
+        for i in range(0, len(samples), batch_size):
+            batch = samples[i:i + batch_size]
+            if is_single_end:
+                pool.starmap(rmc_extract_microbiome_reads, [(sample, is_single_end, itm_path) for sample in batch])
+            else:
+                pool.starmap(rmc_extract_microbiome_reads, [(sample, is_single_end, itm_path) for sample in batch])
+    print("   ")
+    print(">>>=== Microbiome reads extraction completed.")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Step 5: Decontaminate microbiome reads from Kraken2 output")
+    parser.add_argument("--path5_mr", type=str, help="Path to extracted microbiome reads")
+    parser.add_argument("--path4_ku1", type=str, help="Path to Kraken2 outputs")
+    parser.add_argument("--path6_rcr", type=str, help="Path to decontaminate microbiome reads")
+    parser.add_argument("--itm_path", type=str, help="Path to ITMtools")
+    parser.add_argument("--batch_size", type=int, default=1, help="Number of samples to process simultaneously")
+    parser.add_argument("--se", action="store_true", help="Use single-end processing. Default is paired-end.")
+    args = parser.parse_args()
+
+    step5_decontamination(args.path5_mr, args.path4_ku1, args.path6_rcr, args.itm_path, args.batch_size, args.se)
+
+####8、输出微生物分类数据
+##使用kraken进行分类
+# Define your variables here
+db_ku="/home/rstudio/SAHMI/k2_pluspf_20230605"
+folder_rcr="/mnt/DATA1/TCGA/07-rcr/1"
+folder_r2="/mnt/DATA1/TCGA/08-ku2"
+kt_code_path="/root/1-Biosoft/KrakenTools-1.2"
+
+# Create output directory if it doesn't exist
+mkdir -p $folder_r2
+
+# Continue with the rest of your script using sorted input
+ls "${folder_rcr}"/*_rcr_1.fastq.gz | sort | while IFS= read -r filepath; do
+  filename=$(basename "$filepath")
+  # Rest of your script...
+  sample_id="${filename%_rcr_1.fastq.gz}" 
+  kraken_report="${folder_r2}/${sample_id}.kraken.report.txt" 
+  kraken_out="${folder_r2}/${sample_id}.kraken.output.txt" 
+  faq_rcr1="${folder_mr}/${sample_id}_rcr_1.fastq.gz" 
+  faq_rcr2="${folder_mr}/${sample_id}_rcr_2.fastq.gz" 
+
+  if [ -f "${folder_r2}/${sample_id}.kraken.report.txt" ]; then
+    echo "Skipping sample ${sample_id} as ku2 output already exists."
+    continue
+  fi
+
+  /root/1-Biosoft/kraken2-2.1.3/kraken2 --db "$db_ku" --threads 32 --paired --report-minimizer-data --report $kraken_report --use-names --output $kraken_out --paired $faq_rcr1 $faq_rcr2 
+  mpa_output="${folder_r2}/${sample_id}.kraken.mpa.txt" 
+  python "${kt_code_path}/kreport2mpa.py" -r $kraken_report -o $mpa_output 
+  krona_output="${folder_r2}/${sample_id}.krona.txt" 
+  python "${kt_code_path}/kreport2krona.py" -r $kraken_report -o $krona_output 
+
+done
+
+
+# Define your variables here
+db_ku="/home/rstudio/SAHMI/k2_pluspf_20230605"
+folder_rcr="/mnt/DATA1/TCGA/07-rcr"
+folder_r2="/mnt/DATA1/TCGA/08-ku2"
+kt_code_path="/root/1-Biosoft/KrakenTools-1.2"
+
+# Create output directory if it doesn't exist
+mkdir -p $folder_r2
+
+# Continue with the rest of your script using sorted input
+ls "${folder_rcr}"/*_rcr_1.fastq.gz | sort -r | while IFS= read -r filepath; do
+  filename=$(basename "$filepath")
+  # Rest of your script...
+  sample_id="${filename%_rcr_1.fastq.gz}" 
+  kraken_report="${folder_r2}/${sample_id}.kraken.report.txt" 
+  kraken_out="${folder_r2}/${sample_id}.kraken.output.txt" 
+  faq_rcr1="${folder_mr}/${sample_id}_rcr_1.fastq.gz" 
+  faq_rcr2="${folder_mr}/${sample_id}_rcr_2.fastq.gz" 
+
+  if [ -f "${folder_r2}/${sample_id}.kraken.report.txt" ]; then
+    echo "Skipping sample ${sample_id} as ku2 output already exists."
+    continue
+  fi
+
+  /root/1-Biosoft/kraken2-2.1.3/kraken2 --db "$db_ku" --threads 32 --paired --report-minimizer-data --report $kraken_report --use-names --output $kraken_out --paired $faq_rcr1 $faq_rcr2 
+  mpa_output="${folder_r2}/${sample_id}.kraken.mpa.txt" 
+  python "${kt_code_path}/kreport2mpa.py" -r $kraken_report -o $mpa_output 
+  krona_output="${folder_r2}/${sample_id}.krona.txt" 
+  python "${kt_code_path}/kreport2krona.py" -r $kraken_report -o $krona_output 
+
+done
+
+
+# 合并数据到mpa
+
+bash
+conda activate rna
+folder3="/mnt/DATA1/TCGA/07-ku2"
+folder4="/mnt/DATA1/TCGA/08-otu-mpa"
+kt_code_path="/root/1-Biosoft/KrakenTools-1.2"
+
+python ${kt_code_path}/combine_mpa.py \
+      -i $folder3/*.mpa.txt \
+      -o $folder4/0-combine_mpa.txt
+
+
+
+for file in "${folder3}"/*.mpa.txt; do
+    sample_id=$(echo $file | sed 's/\.kraken\.mpa\.txt//')
+    echo $sample_id >> "${folder4}"/0-sample_id.txt
+done
+
+sort -u "${folder4}"/0-sample_id.txt -o "${folder4}"/0-sample_id.txt
+
+
+# 合并数据到otu
+bash
+
+folder3="/mnt/DATA1/TCGA/08-ku2"
+folder4="/mnt/DATA1/TCGA/09-otu-mpa"
+kt_code_path="/root/1-Biosoft/itm_helper"
+
+python3 ${kt_code_path}/kraken2otu.py --extension kraken.report.txt --inputfolder $folder3 --level p --outdir $folder4
+python3 ${kt_code_path}/kraken2otu.py --extension kraken.report.txt --inputfolder $folder3 --level f --outdir $folder4
+python3 ${kt_code_path}/kraken2otu.py --extension kraken.report.txt --inputfolder $folder3 --level g --outdir $folder4
+python3 ${kt_code_path}/kraken2otu.py --extension kraken.report.txt --inputfolder $folder3 --level s --outdir $folder4
+
+mv "${folder3}"/otu_table* $folder4
+
+
