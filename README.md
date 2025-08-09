@@ -48,6 +48,6 @@ Extract high-confidence microbial reads and generate final microbiome abundance 
 - Scalable — Optimized for integration of datasets from multiple global cohorts.
 - Reproducible — Modular structure with version-controlled tools and databases.
 
-  ## Environment
+## Environment
 - Python 3.12.2
 - R 3.4 
